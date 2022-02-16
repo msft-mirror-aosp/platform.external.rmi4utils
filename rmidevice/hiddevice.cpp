@@ -31,7 +31,6 @@
 #include <linux/hidraw.h>
 #include <signal.h>
 #include <stdlib.h>
-#include <sys/inotify.h>
 
 #include "hiddevice.h"
 
@@ -40,6 +39,12 @@
 #define RMI_READ_DATA_REPORT_ID             0xb // Input Report
 #define RMI_ATTN_REPORT_ID                  0xc // Input Report
 #define RMI_SET_RMI_MODE_REPORT_ID          0xf // Feature Report
+
+enum rmi_hid_mode_type {
+	HID_RMI4_MODE_MOUSE                     = 0,
+	HID_RMI4_MODE_ATTN_REPORTS              = 1,
+	HID_RMI4_MODE_NO_PACKED_ATTN_REPORTS    = 2,
+};
 
 enum hid_report_type {
 	HID_REPORT_TYPE_UNKNOWN			= 0x0,
@@ -66,8 +71,6 @@ int HIDDevice::Open(const char * filename)
 {
 	int rc;
 	int desc_size;
-	std::string hidDeviceName;
-	std::string hidDriverName;
 
 	if (!filename)
 		return -EINVAL;
@@ -81,80 +84,58 @@ int HIDDevice::Open(const char * filename)
 
 	rc = ioctl(m_fd, HIDIOCGRDESCSIZE, &desc_size);
 	if (rc < 0)
-		goto error;
+		return rc;
 	
 	m_rptDesc.size = desc_size;
 	rc = ioctl(m_fd, HIDIOCGRDESC, &m_rptDesc);
 	if (rc < 0)
-		goto error;
+		return rc;
 	
 	rc = ioctl(m_fd, HIDIOCGRAWINFO, &m_info);
 	if (rc < 0)
-		goto error;
+		return rc;
 
 	if (m_info.vendor != SYNAPTICS_VENDOR_ID) {
 		errno = -ENODEV;
-		rc = -1;
-		goto error;
+		return -1;
 	}
 
-	ParseReportDescriptor();
+	ParseReportSizes();
 
 	m_inputReport = new unsigned char[m_inputReportSize]();
 	if (!m_inputReport) {
 		errno = -ENOMEM;
-		rc = -1;
-		goto error;
+		return -1;
 	}
 
 	m_outputReport = new unsigned char[m_outputReportSize]();
 	if (!m_outputReport) {
 		errno = -ENOMEM;
-		rc = -1;
-		goto error;
+		return -1;
 	}
 
 	m_readData = new unsigned char[m_inputReportSize]();
 	if (!m_readData) {
 		errno = -ENOMEM;
-		rc = -1;
-		goto error;
+		return -1;
 	}
 
 	m_attnData = new unsigned char[m_inputReportSize]();
 	if (!m_attnData) {
 		errno = -ENOMEM;
-		rc = -1;
-		goto error;
+		return -1;
 	}
 
 	m_deviceOpen = true;
 
-	// Determine which mode the device is currently running in based on the current HID driver
-	// hid-rmi indicated RMI Mode 1 all others would be Mode 0
-	if (LookupHidDeviceName(m_info.bustype, m_info.vendor, m_info.product, hidDeviceName)) {
-		if (LookupHidDriverName(hidDeviceName, hidDriverName)) {
-			if (hidDriverName == "hid-rmi")
-				m_initialMode = HID_RMI4_MODE_ATTN_REPORTS;
-		}
-	}
-
-	if (m_initialMode != m_mode) {
-		rc = SetMode(m_mode);
-		if (rc) {
-			rc = -1;
-			goto error;
-		}
-	}
+	rc = SetMode(HID_RMI4_MODE_ATTN_REPORTS);
+	if (rc)
+		return -1;
 
 	return 0;
-
-error:
-	Close();
-	return rc;
 }
 
-void HIDDevice::ParseReportDescriptor()
+void HIDDevice::ParseReportSizes()
 {
 	bool isVendorSpecific = false;
 	bool isReport = false;
@@ -162,18 +143,10 @@ void HIDDevice::ParseReportDescriptor()
 	int reportSize = 0;
 	int reportCount = 0;
 	enum hid_report_type hidReportType = HID_REPORT_TYPE_UNKNOWN;
-	bool inCollection = false;
 
 	for (unsigned int i = 0; i < m_rptDesc.size; ++i) {
-		if (m_rptDesc.value[i] == 0xc0) {
-			inCollection = false;
-			isVendorSpecific = false;
-			isReport = false;
-			continue;
-		}
-
 		if (isVendorSpecific) {
-			if (m_rptDesc.value[i] == 0x85) {
+			if (m_rptDesc.value[i] == 0x85 || m_rptDesc.value[i] == 0xc0) {
 				if (isReport) {
 					// finish up data on the previous report
 					totalReportSize = (reportSize * reportCount) >> 3;
@@ -200,7 +173,13 @@ void HIDDevice::ParseReportDescriptor()
 				reportCount = 0;
 				hidReportType = HID_REPORT_TYPE_UNKNOWN;
 
-				isReport = true;
+				if (m_rptDesc.value[i] == 0x85)
+					isReport = true;
+				else
+					isReport = false;
+
+				if (m_rptDesc.value[i] == 0xc0)
+					isVendorSpecific = false;
 			}
 
 			if (isReport) {
@@ -230,52 +209,12 @@ void HIDDevice::ParseReportDescriptor()
 			}
 		}
 
-		if (!inCollection) {
-			switch (m_rptDesc.value[i]) {
-				case 0x00:
-				case 0x01:
-				case 0x02:
-				case 0x03:
-				case 0x04:
-					inCollection = true;
-					break;
-				case 0x05:
-					inCollection = true;
-
-					if (i + 3 >= m_rptDesc.size)
-						break;
-
-					// touchscreens with active pen have a Generic Mouse collection
-					// so stop searching if we have already found the touchscreen digitizer
-					// usage.
-					if (m_deviceType == RMI_DEVICE_TYPE_TOUCHSCREEN)
-						break;
-				
-					if (m_rptDesc.value[i + 1] == 0x01) {
-						if (m_rptDesc.value[i + 2] == 0x09 && m_rptDesc.value[i + 3] == 0x02)
-							m_deviceType = RMI_DEVICE_TYPE_TOUCHPAD;
-					} else if (m_rptDesc.value[i + 1] == 0x0d) {
-						if (m_rptDesc.value[i + 2] == 0x09 && m_rptDesc.value[i + 3] == 0x04)
-							m_deviceType = RMI_DEVICE_TYPE_TOUCHSCREEN;
-						// for Precision Touch Pad
-						else if (m_rptDesc.value[i + 2] == 0x09 && m_rptDesc.value[i + 3] == 0x05)
-							m_deviceType = RMI_DEVICE_TYPE_TOUCHPAD;
-					}
-					i += 3;
-					break;
-				case 0x06:
-					inCollection = true;
-					if (i + 2 >= m_rptDesc.size)
-						break;
-
-					if (m_rptDesc.value[i + 1] == 0x00 && m_rptDesc.value[i + 2] == 0xFF)
-						isVendorSpecific = true;
-					i += 2;
-					break;
-				default:
-					break;
-
-			}
+		if (i + 2 >= m_rptDesc.size)
+			return;
+		if (m_rptDesc.value[i] == 0x06 && m_rptDesc.value[i + 1] == 0x00
+						&& m_rptDesc.value[i + 2] == 0xFF) {
+			isVendorSpecific = true;
+			i += 2;
 		}
 	}
 }
@@ -338,14 +277,12 @@ int HIDDevice::Read(unsigned short addr, unsigned char *buf, unsigned short len)
 			if (rc > 0 && reportId == RMI_READ_DATA_REPORT_ID) {
 				if (static_cast<ssize_t>(m_inputReportSize) <
 				    std::max(HID_RMI4_READ_INPUT_COUNT,
-					     HID_RMI4_READ_INPUT_DATA)){
+					     HID_RMI4_READ_INPUT_DATA))
 					return -1;
-				}
 				bytesInDataReport = m_readData[HID_RMI4_READ_INPUT_COUNT];
 				if (bytesInDataReport > bytesToRequest
-				    || bytesReadPerRequest + bytesInDataReport > len){
+				    || bytesReadPerRequest + bytesInDataReport > len)
 					return -1;
-				}
 				memcpy(buf + bytesReadPerRequest, &m_readData[HID_RMI4_READ_INPUT_DATA],
 					bytesInDataReport);
 				bytesReadPerRequest += bytesInDataReport;
@@ -408,14 +345,10 @@ int HIDDevice::SetMode(int mode)
 
 void HIDDevice::Close()
 {
-	RMIDevice::Close();
-
 	if (!m_deviceOpen)
 		return;
 
-	if (m_initialMode != m_mode)
-		SetMode(m_initialMode);
-
+	SetMode(HID_RMI4_MODE_MOUSE);
 	m_deviceOpen = false;
 	close(m_fd);
 	m_fd = -1;
@@ -594,15 +527,10 @@ void HIDDevice::PrintReport(const unsigned char *report)
 // Print protocol specific device information
 void HIDDevice::PrintDeviceInfo()
 {
-	enum RMIDeviceType deviceType = GetDeviceType();
-
 	fprintf(stdout, "HID device info:\nBus: %s Vendor: 0x%04x Product: 0x%04x\n",
 		m_info.bustype == BUS_I2C ? "I2C" : "USB", m_info.vendor, m_info.product);
 	fprintf(stdout, "Report sizes: input: %ld output: %ld\n", (unsigned long)m_inputReportSize,
 		(unsigned long)m_outputReportSize);
-	if (deviceType)
-		fprintf(stdout, "device type: %s\n", deviceType == RMI_DEVICE_TYPE_TOUCHSCREEN ?
-			"touchscreen" : "touchpad");
 }
 
 bool WriteDeviceNameToFile(const char * file, const char * str)
@@ -627,159 +555,76 @@ bool WriteDeviceNameToFile(const char * file, const char * str)
 
 	return close(fd) == 0 && size == static_cast<ssize_t>(strlen(str));
 }
-static const char * const absval[6] = { "Value", "Min  ", "Max  ", "Fuzz ", "Flat ", "Resolution "};
-#define KEY_MAX			0x2ff
-#define EV_MAX			0x1f
-#define BITS_PER_LONG (sizeof(long) * 8)
-#define NBITS(x) ((((x)-1)/BITS_PER_LONG)+1)
-#define OFF(x)  ((x)%BITS_PER_LONG)
-#define BIT(x)  (1UL<<OFF(x))
-#define LONG(x) ((x)/BITS_PER_LONG)
-#define test_bit(bit, array)	((array[LONG(bit)] >> OFF(bit)) & 1)
-#define DEV_INPUT_EVENT "/dev/input"
-#define EVENT_DEV_NAME "event"
-/**
- * Filter for the AutoDevProbe scandir on /dev/input.
- *
- * @param dir The current directory entry provided by scandir.
- *
- * @return Non-zero if the given directory entry starts with "event", or zero
- * otherwise.
- */
-static int is_event_device(const struct dirent *dir) {
-	return strncmp(EVENT_DEV_NAME, dir->d_name, 5) == 0;
-}
 
-bool HIDDevice::CheckABSEvent()
-{
-	int fd=-1;
-	unsigned int type;
-	int abs[6] = {0};
-	int k;
-	struct dirent **namelist;
-	int i, ndev, devnum, match;
-	char *filename;
-	int max_device = 0;
-    char input_event_name[PATH_MAX];
-	unsigned long bit[EV_MAX][NBITS(KEY_MAX)];
-
-
-#ifdef __BIONIC__
-	// Android's libc doesn't have the GNU versionsort extension.
-	ndev = scandir(DEV_INPUT_EVENT, &namelist, is_event_device, alphasort);
-#else
-	ndev = scandir(DEV_INPUT_EVENT, &namelist, is_event_device, versionsort);
-#endif
-	if (ndev <= 0)
-		return false;
-	for (i = 0; i < ndev; i++)
-	{
-		char fname[64];
-		int fd = -1;
-		char name[256] = "???";
-
-		snprintf(fname, sizeof(fname),
-			 "%s/%s", DEV_INPUT_EVENT, namelist[i]->d_name);
-		fd = open(fname, O_RDONLY);
-		if (fd < 0)
-			continue;
-		ioctl(fd, EVIOCGNAME(sizeof(name)), name);
-		//fprintf(stderr, "%s:	%s\n", fname, name);
-		close(fd);
-
-		if(strstr(name, m_transportDeviceName.c_str()+4))
-		{
-			snprintf(input_event_name, sizeof(fname), "%s", fname);
-		}
-		free(namelist[i]);
-	}
-	
-	if ((fd = open(input_event_name, O_RDONLY)) < 0) {
-		if (errno == EACCES && getuid() != 0)
-			fprintf(stderr, "No access right \n");
-	}
-	memset(bit, 0, sizeof(bit));
-	ioctl(fd, EVIOCGBIT(0, EV_MAX), bit[0]);
-	for (type = 0; type < EV_MAX; type++) {
-		if (test_bit(type, bit[0]) && type == EV_ABS) {
-			ioctl(fd, EVIOCGBIT(type, KEY_MAX), bit[type]);
-			if (test_bit(ABS_X, bit[type])) {
-				ioctl(fd, EVIOCGABS(ABS_X), abs);
-				if(abs[2] == 0) //maximum
-				{
-					Sleep(1000);
-					return false;
-				}
-			}
-		}
-	}
-	return true;
-}
 void HIDDevice::RebindDriver()
 {
 	int bus = m_info.bustype;
 	int vendor = m_info.vendor;
 	int product = m_info.product;
 	std::string hidDeviceName;
+	std::string transportDeviceName;
+	std::string driverPath;
 	std::string bindFile;
 	std::string unbindFile;
 	std::string hidrawFile;
-	int notifyFd;
-	int wd;
+	struct stat stat_buf;
 	int rc;
+	int i;
+
 	Close();
 
-	notifyFd = inotify_init();
-	if (notifyFd < 0) {
-		fprintf(stderr, "Failed to initialize inotify\n");
+	if (!LookupHidDeviceName(bus, vendor, product, hidDeviceName)) {
+		fprintf(stderr, "Failed to find HID device name for the specified device: bus (0x%x) vendor: (0x%x) product: (0x%x)\n",
+			bus, vendor, product);
 		return;
 	}
 
-	wd = inotify_add_watch(notifyFd, "/dev", IN_CREATE);
-	if (wd < 0) {
-		fprintf(stderr, "Failed to add watcher for /dev\n");
+	if (!FindTransportDevice(bus, hidDeviceName, transportDeviceName, driverPath)) {
+		fprintf(stderr, "Failed to find the transport device / driver for %s\n", hidDeviceName.c_str());
 		return;
 	}
 
-	if (m_transportDeviceName == "") {
-		if (!LookupHidDeviceName(bus, vendor, product, hidDeviceName)) {
-			fprintf(stderr, "Failed to find HID device name for the specified device: bus (0x%x) vendor: (0x%x) product: (0x%x)\n",
-				bus, vendor, product);
-			return;
-		}
+	bindFile = driverPath + "bind";
+	unbindFile = driverPath + "unbind";
 
-		if (!FindTransportDevice(bus, hidDeviceName, m_transportDeviceName, m_driverPath)) {
-			fprintf(stderr, "Failed to find the transport device / driver for %s\n", hidDeviceName.c_str());
-			return;
-		}
-
-	}
- 
-	bindFile = m_driverPath + "bind";
-	unbindFile = m_driverPath + "unbind";
-
-	Sleep(500);
-	if (!WriteDeviceNameToFile(unbindFile.c_str(), m_transportDeviceName.c_str())) {
+	if (!WriteDeviceNameToFile(unbindFile.c_str(), transportDeviceName.c_str())) {
 		fprintf(stderr, "Failed to unbind HID device %s: %s\n",
-			m_transportDeviceName.c_str(), strerror(errno));
-		return;
-	}
-	Sleep(500);
-	if (!WriteDeviceNameToFile(bindFile.c_str(), m_transportDeviceName.c_str())) {
-		fprintf(stderr, "Failed to bind HID device %s: %s\n",
-			m_transportDeviceName.c_str(), strerror(errno));
+			transportDeviceName.c_str(), strerror(errno));
 		return;
 	}
 
-	if (WaitForHidRawDevice(notifyFd, hidrawFile)) {
-		rc = Open(hidrawFile.c_str());
-		if (rc)
-			fprintf(stderr, "Failed to open device (%s) during rebind: %d: errno: %s (%d)\n",
-					hidrawFile.c_str(), rc, strerror(errno), errno);
+	if (!WriteDeviceNameToFile(bindFile.c_str(), transportDeviceName.c_str())) {
+		fprintf(stderr, "Failed to bind HID device %s: %s\n",
+			transportDeviceName.c_str(), strerror(errno));
+		return;
 	}
+
+	// The hid device id has changed since this is now a new hid device. Now we have to look up the new name.
+	if (!LookupHidDeviceName(bus, vendor, product, hidDeviceName)) {
+		fprintf(stderr, "Failed to find HID device name for the specified device: bus (0x%x) vendor: (0x%x) product: (0x%x)\n",
+			bus, vendor, product);
+		return;
+	}
+
+	if (!FindHidRawFile(hidDeviceName, hidrawFile)) {
+		fprintf(stderr, "Failed to find the hidraw device file for %s\n", hidDeviceName.c_str());
+		return;
+	}
+
+	for (i = 0; i < 200; i++) {
+		rc = stat(hidrawFile.c_str(), &stat_buf);
+		if (!rc)
+			break;
+		Sleep(5);
+	}
+
+	rc = Open(hidrawFile.c_str());
+	if (rc)
+		fprintf(stderr, "Failed to open device (%s) during rebind: %d: errno: %s (%d)\n",
+				hidrawFile.c_str(), rc, strerror(errno), errno);
 }
 
-bool HIDDevice::FindTransportDevice(uint32_t bus, std::string & hidDeviceName,
+bool HIDDevice::FindTransportDevice(int bus, std::string & hidDeviceName,
 			std::string & transportDeviceName, std::string & driverPath)
 {
 	std::string devicePrefix = "/sys/bus/";
@@ -793,15 +638,7 @@ bool HIDDevice::FindTransportDevice(uint32_t bus, std::string & hidDeviceName,
 
 	if (bus == BUS_I2C) {
 		devicePrefix += "i2c/";
-		// From new patch released on 2020/11, i2c_hid would be renamed as i2c_hid_acpi,
-		// and also need backward compatible.
-		std::string driverPathTemp = devicePrefix + "drivers/i2c_hid/";
-		DIR *driverPathtest = opendir(driverPathTemp.c_str());
-		if(!driverPathtest) {
-			driverPath = devicePrefix + "drivers/i2c_hid_acpi/";
-		} else {
-			driverPath = devicePrefix + "drivers/i2c_hid/";
-		}
+		driverPath = devicePrefix + "drivers/i2c_hid/";
 	} else {
 		devicePrefix += "usb/";
 		driverPath = devicePrefix + "drivers/usbhid/";
@@ -848,14 +685,14 @@ bool HIDDevice::FindTransportDevice(uint32_t bus, std::string & hidDeviceName,
 	return deviceFound;
 }
 
-bool HIDDevice::LookupHidDeviceName(uint32_t bus, int16_t vendorId, int16_t productId, std::string & deviceName)
+bool HIDDevice::LookupHidDeviceName(int bus, int vendorId, int productId, std::string & deviceName)
 {
 	bool ret = false;
 	struct dirent * devDirEntry;
 	DIR * devDir;
 	char devicePrefix[15];
 
-	snprintf(devicePrefix, 15, "%04X:%04X:%04X", bus, (vendorId & 0xFFFF), (productId & 0xFFFF));
+	snprintf(devicePrefix, 15, "%04X:%04X:%04X", bus, vendorId, productId);
 
 	devDir = opendir("/sys/bus/hid/devices");
 	if (!devDir)
@@ -873,128 +710,27 @@ bool HIDDevice::LookupHidDeviceName(uint32_t bus, int16_t vendorId, int16_t prod
 	return ret;
 }
 
-bool HIDDevice::LookupHidDriverName(std::string &deviceName, std::string &driverName)
+bool HIDDevice::FindHidRawFile(std::string & deviceName, std::string & hidrawFile)
 {
 	bool ret = false;
-	ssize_t sz;
-	char link[PATH_MAX];
-	std::string driverLink = "/sys/bus/hid/devices/" + deviceName + "/driver";
-
-	sz = readlink(driverLink.c_str(), link, PATH_MAX);
-	if (sz == -1)
-		return ret;
-
-	link[sz] = 0;
-
-	driverName = std::string(StripPath(link, PATH_MAX));
-
-	return true;
-}
-
-bool HIDDevice::WaitForHidRawDevice(int notifyFd, std::string & hidrawFile)
-{
-	struct timeval timeout;
-	fd_set fds;
-	int rc;
-	ssize_t eventBytesRead;
-	int eventBytesAvailable;
-	size_t sz;
-	char link[PATH_MAX];
-	std::string transportDeviceName;
-	std::string driverPath;
-	std::string hidDeviceName;
-	int offset = 0;
-
-	for (;;) {
-		FD_ZERO(&fds);
-		FD_SET(notifyFd, &fds);
-
-		timeout.tv_sec = 20;
-		timeout.tv_usec = 0;
-
-		rc = select(notifyFd + 1, &fds, NULL, NULL, &timeout);
-		if (rc < 0) {
-			if (errno == -EINTR)
-				continue;
-
-			return false;
-		}
-
-		if (rc == 0) {
-			return false;
-		}
-
-		if (FD_ISSET(notifyFd, &fds)) {
-			struct inotify_event * event;
-
-			rc = ioctl(notifyFd, FIONREAD, &eventBytesAvailable);
-			if (rc < 0) {
-				continue;
-			}
-
-			char buf[eventBytesAvailable];
-
-			eventBytesRead = read(notifyFd, buf, eventBytesAvailable);
-			if (eventBytesRead < 0) {
-				continue;
-			}
-
-			while (offset < eventBytesRead) {
-				event = (struct inotify_event *)&buf[offset];
-
-				if (!strncmp(event->name, "hidraw", 6)) {
-					std::string classPath = std::string("/sys/class/hidraw/")
-												+ event->name + "/device";
-					sz = readlink(classPath.c_str(), link, PATH_MAX);
-					link[sz] = 0;
-
-					hidDeviceName = std::string(link).substr(9, 19);
-
-					if (!FindTransportDevice(m_info.bustype, hidDeviceName, transportDeviceName, driverPath)) {
-						fprintf(stderr, "Failed to find the transport device / driver for %s\n", hidDeviceName.c_str());
-						continue;
-					}
-
-					if (transportDeviceName == m_transportDeviceName) {
-						hidrawFile = std::string("/dev/") + event->name;
-						return true;
-					}
-				}
-
-				offset += sizeof(struct inotify_event) + event->len;
-			}
-		}
-	}
-}
-
-bool HIDDevice::FindDevice(enum RMIDeviceType type)
-{
-	DIR * devDir;
+	char hidrawDir[PATH_MAX];
 	struct dirent * devDirEntry;
-	char deviceFile[PATH_MAX];
-	bool found = false;
-	int rc;
-	devDir = opendir("/dev");
+	DIR * devDir;
+
+	snprintf(hidrawDir, PATH_MAX, "/sys/bus/hid/devices/%s/hidraw", deviceName.c_str());
+
+	devDir = opendir(hidrawDir);
 	if (!devDir)
-		return -1;
+		return false;
 
 	while ((devDirEntry = readdir(devDir)) != NULL) {
-		if (strstr(devDirEntry->d_name, "hidraw")) {
-			snprintf(deviceFile, PATH_MAX, "/dev/%s", devDirEntry->d_name);
-			fprintf(stdout, "Got device : /dev/%s\n", devDirEntry->d_name);
-			rc = Open(deviceFile);
-			if (rc != 0) {
-				continue;
-			} else if (type != RMI_DEVICE_TYPE_ANY && GetDeviceType() != type) {
-				Close();
-				continue;
-			} else {
-				found = true;
-				break;
-			}
+		if (!strncmp(devDirEntry->d_name, "hidraw", 6)) {
+			hidrawFile = std::string("/dev/") + devDirEntry->d_name;
+			ret = true;
+			break;
 		}
 	}
 	closedir(devDir);
-	
-	return found;
+
+	return ret;
 }
