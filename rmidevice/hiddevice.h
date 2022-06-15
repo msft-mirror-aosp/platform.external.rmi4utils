@@ -20,14 +20,7 @@
 
 #include <linux/hidraw.h>
 #include <string>
-#include <stdint.h>
 #include "rmidevice.h"
-
-enum rmi_hid_mode_type {
-	HID_RMI4_MODE_MOUSE                     = 0,
-	HID_RMI4_MODE_ATTN_REPORTS              = 1,
-	HID_RMI4_MODE_NO_PACKED_ATTN_REPORTS    = 2,
-};
 
 class HIDDevice : public RMIDevice
 {
@@ -37,11 +30,7 @@ public:
 		      m_inputReportSize(0),
 		      m_outputReportSize(0),
 		      m_featureReportSize(0),
-		      m_deviceOpen(false),
-		      m_mode(HID_RMI4_MODE_ATTN_REPORTS),
-		      m_initialMode(HID_RMI4_MODE_MOUSE),
-		      m_transportDeviceName(""),
-		      m_driverPath("")
+		      m_deviceOpen(false)
 	{}
 	virtual int Open(const char * filename);
 	virtual int Read(unsigned short addr, unsigned char *buf,
@@ -58,9 +47,6 @@ public:
 	~HIDDevice() { Close(); }
 
 	virtual void PrintDeviceInfo();
-
-	virtual bool FindDevice(enum RMIDeviceType type = RMI_DEVICE_TYPE_ANY);
-	virtual bool CheckABSEvent();
 
 private:
 	int m_fd;
@@ -81,23 +67,21 @@ private:
 
 	bool m_deviceOpen;
 
-	rmi_hid_mode_type m_mode;
-	rmi_hid_mode_type m_initialMode;
-
-	std::string m_transportDeviceName;
-	std::string m_driverPath;
+	enum mode_type {
+		HID_RMI4_MODE_MOUSE			= 0,
+		HID_RMI4_MODE_ATTN_REPORTS		= 1,
+		HID_RMI4_MODE_NO_PACKED_ATTN_REPORTS	= 2,
+	};
 
 	int GetReport(int *reportId, struct timeval * timeout = NULL);
 	void PrintReport(const unsigned char *report);
-	void ParseReportDescriptor();
-
-	bool WaitForHidRawDevice(int notifyFd, std::string & hidraw);
+	void ParseReportSizes();
 
 	// static HID utility functions
-	static bool LookupHidDeviceName(uint32_t bus, int16_t vendorId, int16_t productId, std::string &deviceName);
-	static bool LookupHidDriverName(std::string &deviceName, std::string &driverName);
-	static bool FindTransportDevice(uint32_t bus, std::string & hidDeviceName,
+	static bool LookupHidDeviceName(int bus, int vendorId, int productId, std::string &deviceName);
+	static bool FindTransportDevice(int bus, std::string & hidDeviceName,
 					std::string & transportDeviceName, std::string & driverPath);
+	static bool FindHidRawFile(std::string & hidDeviceName, std::string & hidrawFile);
  };
 
 #endif /* _HIDDEVICE_H_ */
