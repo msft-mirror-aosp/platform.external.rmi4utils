@@ -43,12 +43,18 @@
 #define RMI_SET_LID_MODE_REPORT_ID          0xe // Feature Report
 
 
-enum hid_report_type {
-	HID_REPORT_TYPE_UNKNOWN			= 0x0,
-	HID_REPORT_TYPE_INPUT			= 0x81,
-	HID_REPORT_TYPE_OUTPUT			= 0x91,
-	HID_REPORT_TYPE_FEATURE			= 0xb1,
+// Make sure that none of the enums/macros conflict with possible
+// kernel definition/names.
+enum hid_rmi4_report_type {
+  HID_RMI4_REPORT_UNKNOWN = 0,
+  HID_RMI4_REPORT_INPUT = 1,
+  HID_RMI4_REPORT_OUTPUT = 2,
+  HID_RMI4_REPORT_FEATURE = 3,
 };
+
+#define HID_RMI4_REPORT_TYPE_INPUT			0x81
+#define HID_RMI4_REPORT_TYPE_OUTPUT			0x91
+#define HID_RMI4_REPORT_TYPE_FEATURE			0xb1
 
 #define HID_RMI4_REPORT_ID			0
 #define HID_RMI4_READ_INPUT_COUNT		1
@@ -163,7 +169,7 @@ void HIDDevice::ParseReportDescriptor()
 	int totalReportSize = 0;
 	int reportSize = 0;
 	int reportCount = 0;
-	enum hid_report_type hidReportType = HID_REPORT_TYPE_UNKNOWN;
+	enum hid_rmi4_report_type hidReportType = HID_RMI4_REPORT_UNKNOWN;
 	bool inCollection = false;
 
 	for (unsigned int i = 0; i < m_rptDesc.size; ++i) {
@@ -181,16 +187,16 @@ void HIDDevice::ParseReportDescriptor()
 					totalReportSize = (reportSize * reportCount) >> 3;
 
 					switch (hidReportType) {
-						case HID_REPORT_TYPE_INPUT:
+						case HID_RMI4_REPORT_INPUT:
 							m_inputReportSize = totalReportSize + 1;
 							break;
-						case HID_REPORT_TYPE_OUTPUT:
+						case HID_RMI4_REPORT_OUTPUT:
 							m_outputReportSize = totalReportSize + 1;
 							break;
-						case HID_REPORT_TYPE_FEATURE:
+						case HID_RMI4_REPORT_FEATURE:
 							m_featureReportSize = totalReportSize + 1;
 							break;
-						case HID_REPORT_TYPE_UNKNOWN:
+						case HID_RMI4_REPORT_UNKNOWN:
 						default:
 							break;
 					}
@@ -200,7 +206,7 @@ void HIDDevice::ParseReportDescriptor()
 				totalReportSize = 0;
 				reportSize = 0;
 				reportCount = 0;
-				hidReportType = HID_REPORT_TYPE_UNKNOWN;
+				hidReportType = HID_RMI4_REPORT_UNKNOWN;
 
 				isReport = true;
 			}
@@ -224,14 +230,14 @@ void HIDDevice::ParseReportDescriptor()
 					hasVendorDefineLIDMode = true;
 				}
 
-				if (m_rptDesc.value[i] == HID_REPORT_TYPE_INPUT)
-					hidReportType = HID_REPORT_TYPE_INPUT;
+				if (m_rptDesc.value[i] == HID_RMI4_REPORT_TYPE_INPUT)
+					hidReportType = HID_RMI4_REPORT_INPUT;
 
-				if (m_rptDesc.value[i] == HID_REPORT_TYPE_OUTPUT)
-					hidReportType = HID_REPORT_TYPE_OUTPUT;
+				if (m_rptDesc.value[i] == HID_RMI4_REPORT_TYPE_OUTPUT)
+					hidReportType = HID_RMI4_REPORT_OUTPUT;
 
-				if (m_rptDesc.value[i] == HID_REPORT_TYPE_FEATURE) {
-					hidReportType = HID_REPORT_TYPE_FEATURE;
+				if (m_rptDesc.value[i] == HID_RMI4_REPORT_TYPE_FEATURE) {
+					hidReportType = HID_RMI4_REPORT_FEATURE;
 				}
 			}
 		}
